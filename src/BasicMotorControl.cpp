@@ -4,6 +4,16 @@
 #include <sTune.h>
 #include <EEPROM.h>
 
+// micro-ROS includes
+#include <micro_ros_arduino.h>
+#include <stdio.h>
+#include <rcl/rcl.h>
+#include <rcl/error_handling.h>
+#include <rclc/rclc.h>
+#include <rclc/executor.h>
+#include <std_msgs/msg/float32_multi_array.h>
+#include <rmw_microros/rmw_microros.h>
+
 // Motor Index Mapping (paired front-to-back):
 //  Index 0 = Front Left   | Index 1 = Front Right
 //  Index 2 = Middle Left  | Index 3 = Middle Right
@@ -107,6 +117,51 @@ const unsigned long RAMPDOWN_INTERVAL = 500;
 unsigned long lastRampDownTime = 0;
 
 // ============================================================
+// MICRO-ROS VARIABLES
+// ============================================================
+rcl_allocator_t allocator;
+rclc_support_t support;
+rcl_node_t node;
+rcl_subscription_t subscriber;
+rcl_publisher_t publisher;
+rclc_executor_t executor;
+
+// Message objects
+std_msgs__msg__Float32MultiArray sub_msg;
+std_msgs__msg__Float32MultiArray pub_msg;
+
+// Backing arrays for Float32MultiArray data
+float sub_data[NMOTORS];
+float pub_data[NMOTORS];
+
+// Layout dimension backing (1D array of 6)
+std_msgs__msg__MultiArrayDimension sub_dim[1];
+std_msgs__msg__MultiArrayDimension pub_dim[1];
+
+// micro-ROS connection state
+bool micro_ros_connected = false;
+unsigned long last_agent_ping = 0;
+const unsigned long AGENT_PING_INTERVAL_MS = 2000;
+
+// Subscriber watchdog — stop motors if no message received
+unsigned long lastSubMsgTime = 0;
+const unsigned long SUB_WATCHDOG_TIMEOUT_MS = 3000;
+bool watchdogTriggered = false;
+
+// Error check macro — on failure, enter error loop with LED blink
+#define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if (temp_rc != RCL_RET_OK) { error_loop(); } }
+#define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; (void)temp_rc; }
+
+// ============================================================
+// FORWARD DECLARATIONS
+// ============================================================
+void stopMotor(int motorIndex);
+void disablePID(int motorIndex);
+void enablePIDForMotor(int motorIndex, float targetRPM);
+void cancelAutoTune();
+void setMotor(int motorIndex, int pwmValue, int direction);
+
+// ============================================================
 // PID CONTROL VARIABLES
 // ============================================================
 float pidInput[NMOTORS] = {0};
@@ -148,6 +203,165 @@ const float AT_OUTPUT_STEP = 150.0f;  // Step PWM during test
 const uint32_t AT_TEST_TIME_SEC = 5;  // Test duration
 const uint32_t AT_SETTLE_TIME_SEC = 2; // Settle time
 const uint16_t AT_SAMPLES = 300;       // Sample count
+
+// ============================================================
+// FUNCTION: micro-ROS error loop (blink LED rapidly)
+// ============================================================
+void error_loop() {
+  while (1) {
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    delay(100);
+  }
+}
+
+// ============================================================
+// FUNCTION: micro-ROS subscription callback
+// ============================================================
+void motorRpmCallback(const void *msgin) {
+  const std_msgs__msg__Float32MultiArray *msg =
+      (const std_msgs__msg__Float32MultiArray *)msgin;
+
+  if (msg == NULL || msg->data.size != NMOTORS) return;
+
+  lastSubMsgTime = millis();
+  watchdogTriggered = false;
+
+  for (int i = 0; i < NMOTORS; i++) {
+    float targetRPM = msg->data.data[i];
+
+    if (fabs(targetRPM) < 0.5f) {
+      // Target ~0: stop this motor
+      if (pidEnabled[i]) {
+        disablePID(i);
+        motorPWM[i] = 0;
+      }
+    } else {
+      enablePIDForMotor(i, targetRPM);
+    }
+  }
+}
+
+// ============================================================
+// FUNCTION: Initialize micro-ROS messages (Float32MultiArray)
+// ============================================================
+void initMessages() {
+  // Subscriber message
+  sub_msg.data.data = sub_data;
+  sub_msg.data.size = NMOTORS;
+  sub_msg.data.capacity = NMOTORS;
+  sub_msg.layout.dim.data = sub_dim;
+  sub_msg.layout.dim.size = 1;
+  sub_msg.layout.dim.capacity = 1;
+  sub_msg.layout.dim.data[0].size = NMOTORS;
+  sub_msg.layout.dim.data[0].stride = NMOTORS;
+  sub_msg.layout.data_offset = 0;
+
+  // Publisher message
+  pub_msg.data.data = pub_data;
+  pub_msg.data.size = NMOTORS;
+  pub_msg.data.capacity = NMOTORS;
+  pub_msg.layout.dim.data = pub_dim;
+  pub_msg.layout.dim.size = 1;
+  pub_msg.layout.dim.capacity = 1;
+  pub_msg.layout.dim.data[0].size = NMOTORS;
+  pub_msg.layout.dim.data[0].stride = NMOTORS;
+  pub_msg.layout.data_offset = 0;
+}
+
+// ============================================================
+// FUNCTION: Setup micro-ROS node, publisher, subscriber, executor
+// ============================================================
+void setupMicroRos() {
+  // USB serial transport
+  set_microros_transports();
+
+  // Wait for agent to be available (blink LED while waiting)
+  while (rmw_uros_ping_agent(200, 3) != RMW_RET_OK) {
+    digitalWrite(LED_BUILTIN, !digitalRead(LED_BUILTIN));
+    delay(300);
+  }
+  digitalWrite(LED_BUILTIN, HIGH);
+
+  allocator = rcl_get_default_allocator();
+
+  // Create init_options and support
+  RCCHECK(rclc_support_init(&support, 0, NULL, &allocator));
+
+  // Create node
+  RCCHECK(rclc_node_init_default(&node, "teensy_motor_node", "", &support));
+
+  // Create subscriber on "teensy_motor_rpm" with best-effort QoS
+  RCCHECK(rclc_subscription_init_best_effort(
+      &subscriber, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
+      "teensy_motor_rpm"));
+
+  // Create publisher on "motor_rpms" with best-effort QoS
+  RCCHECK(rclc_publisher_init_best_effort(
+      &publisher, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
+      "motor_rpms"));
+
+  // Initialize messages
+  initMessages();
+
+  // Create executor with 1 subscription handle
+  RCCHECK(rclc_executor_init(&executor, &support.context, 1, &allocator));
+  RCCHECK(rclc_executor_add_subscription(
+      &executor, &subscriber, &sub_msg, &motorRpmCallback, ON_NEW_DATA));
+
+  micro_ros_connected = true;
+  lastSubMsgTime = millis();
+}
+
+// ============================================================
+// FUNCTION: Publish current motor RPMs
+// ============================================================
+void publishMotorRpms() {
+  if (!micro_ros_connected) return;
+
+  for (int i = 0; i < NMOTORS; i++) {
+    // Publish signed RPM (apply direction sign)
+    float signedRPM = motorRPM_filtered[i];
+    pub_msg.data.data[i] = signedRPM;
+  }
+
+  RCSOFTCHECK(rcl_publish(&publisher, &pub_msg, NULL));
+}
+
+// ============================================================
+// FUNCTION: Stop all motors (safety)
+// ============================================================
+void emergencyStopAll() {
+  for (int i = 0; i < NMOTORS; i++) {
+    disablePID(i);
+    motorPWM[i] = 0;
+    stopMotor(i);
+    isStopping[i] = false;
+  }
+  isRampingDown = false;
+  cancelAutoTune();
+}
+
+// ============================================================
+// FUNCTION: Check subscriber watchdog — stop if no messages
+// ============================================================
+void checkSubscriberWatchdog() {
+  if (!micro_ros_connected) return;
+
+  // Only trigger if at least one motor has PID enabled
+  bool anyEnabled = false;
+  for (int i = 0; i < NMOTORS; i++) {
+    if (pidEnabled[i]) { anyEnabled = true; break; }
+  }
+
+  if (anyEnabled && (millis() - lastSubMsgTime > SUB_WATCHDOG_TIMEOUT_MS)) {
+    if (!watchdogTriggered) {
+      emergencyStopAll();
+      watchdogTriggered = true;
+    }
+  }
+}
 
 // ============================================================
 // FUNCTION: Get encoder position
@@ -235,7 +449,7 @@ void loadPIDConfig() {
       pidKd[i] = config.Kd[i];
       pidControllers[i]->SetTunings(pidKp[i], pidKi[i], pidKd[i]);
     }
-    Serial.println("EEPROM: Loaded per-motor PID gains");
+    // EEPROM: Loaded per-motor PID gains
   } else {
     for (int i = 0; i < NMOTORS; i++) {
       pidKp[i] = DEFAULT_KP;
@@ -243,7 +457,7 @@ void loadPIDConfig() {
       pidKd[i] = DEFAULT_KD;
       pidControllers[i]->SetTunings(pidKp[i], pidKi[i], pidKd[i]);
     }
-    Serial.println("EEPROM: No valid config found, using defaults (Kp=2.0, Ki=5.0, Kd=0.1)");
+    // EEPROM: No valid config, using defaults
   }
 }
 
@@ -259,7 +473,6 @@ void savePIDConfig() {
     config.Kd[i] = pidKd[i];
   }
   EEPROM.put(EEPROM_ADDR, config);
-  Serial.println("EEPROM: Saved per-motor PID gains");
 }
 
 // ============================================================
@@ -300,7 +513,6 @@ void startRampDown() {
   for (int i = 0; i < NMOTORS; i++) disablePID(i);
   isRampingDown = true;
   lastRampDownTime = millis();
-  Serial.println("RAMPDOWN started: reducing all motors by 5 PWM every 0.5s");
 }
 
 void updateRampDown() {
@@ -318,7 +530,6 @@ void updateRampDown() {
     lastRampDownTime = currentTime;
     if (allZero) {
       isRampingDown = false;
-      Serial.println("RAMPDOWN complete: all motors at 0");
     }
   }
 }
@@ -362,8 +573,6 @@ void cancelAutoTune() {
     motorPWM[autoTuneMotor] = 0;
     stopMotor(autoTuneMotor);
     disablePID(autoTuneMotor);
-    Serial.print("AUTOTUNE cancelled for M");
-    Serial.println(autoTuneMotor);
   }
   autoTuneRunning = false;
   autoTuneMotor = -1;
@@ -373,14 +582,8 @@ void cancelAutoTune() {
 // FUNCTION: Start autotune on a specific motor
 // ============================================================
 void startAutoTune(int motorIdx) {
-  if (autoTuneRunning) {
-    Serial.println("AUTOTUNE already running! Send AUTOTUNECANCEL first.");
-    return;
-  }
-  if (motorIdx < 0 || motorIdx >= NMOTORS) {
-    Serial.println("Invalid motor index for AUTOTUNE");
-    return;
-  }
+  if (autoTuneRunning) return;
+  if (motorIdx < 0 || motorIdx >= NMOTORS) return;
 
   // Disable PID on all motors, stop all
   for (int i = 0; i < NMOTORS; i++) {
@@ -399,12 +602,6 @@ void startAutoTune(int motorIdx) {
   tuner.Configure(AT_INPUT_SPAN, AT_OUTPUT_SPAN, AT_OUTPUT_START, AT_OUTPUT_STEP,
                   AT_TEST_TIME_SEC, AT_SETTLE_TIME_SEC, AT_SAMPLES);
   tuner.SetEmergencyStop(AT_INPUT_SPAN);  // e-stop if RPM exceeds span
-
-  Serial.print("AUTOTUNE started on M");
-  Serial.print(motorIdx);
-  Serial.print("(");
-  Serial.print(MOTOR_LABELS[motorIdx]);
-  Serial.println(") — all other motors stopped. Please wait...");
 }
 
 // ============================================================
@@ -415,7 +612,6 @@ void updateAutoTune() {
 
   // Timeout safety
   if (millis() - autoTuneStartTime > AUTOTUNE_TIMEOUT_MS) {
-    Serial.println("AUTOTUNE timeout! Aborting.");
     cancelAutoTune();
     return;
   }
@@ -435,19 +631,6 @@ void updateAutoTune() {
       pidKi[autoTuneMotor] = ki;
       pidKd[autoTuneMotor] = kd;
       pidControllers[autoTuneMotor]->SetTunings(kp, ki, kd);
-
-      Serial.println("=== AUTOTUNE COMPLETE ===");
-      Serial.print("Motor M");
-      Serial.print(autoTuneMotor);
-      Serial.print("(");
-      Serial.print(MOTOR_LABELS[autoTuneMotor]);
-      Serial.print(") => Kp=");
-      Serial.print(kp, 4);
-      Serial.print(" Ki=");
-      Serial.print(ki, 4);
-      Serial.print(" Kd=");
-      Serial.println(kd, 4);
-      Serial.println("Use SAVE to persist these gains to EEPROM.");
 
       // Stop motor after test
       motorPWM[autoTuneMotor] = 0;
@@ -485,54 +668,16 @@ void updatePIDControl() {
   }
 }
 
-// ============================================================
-// FUNCTION: Print PID status for all motors
-// ============================================================
-void printPIDStatus() {
-  Serial.println("=== PID STATUS ===");
-  for (int i = 0; i < NMOTORS; i++) {
-    Serial.print("  M");
-    Serial.print(i);
-    Serial.print("(");
-    Serial.print(MOTOR_LABELS[i]);
-    Serial.print(") Kp=");
-    Serial.print(pidKp[i], 4);
-    Serial.print(" Ki=");
-    Serial.print(pidKi[i], 4);
-    Serial.print(" Kd=");
-    Serial.print(pidKd[i], 4);
-    Serial.print(" | ");
-    if (pidEnabled[i]) {
-      Serial.print("[PID] target=");
-      Serial.print(pidSetpoint[i], 1);
-      Serial.print(" RPM");
-    } else {
-      Serial.print("[MANUAL]");
-    }
-    Serial.println();
-  }
-}
 
-// ============================================================
-// FUNCTION: Parse RPM value from command string at given position
-// ============================================================
-float parseRPMValue(const String& cmd, int startPos) {
-  String val = cmd.substring(startPos);
-  val.trim();
-  return val.toFloat();
-}
 
 // ============================================================
 // SETUP
 // ============================================================
 void setup() {
-  Serial.begin(115200);
-  delay(2000);
-
   pinMode(LED_BUILTIN, OUTPUT);
   digitalWrite(LED_BUILTIN, HIGH);
 
-  // Initialize pins
+  // Initialize motor pins
   for (int i = 0; i < NMOTORS; i++) {
     pinMode(ENCO_CH_1[i], INPUT);
     pinMode(ENCO_CH_2[i], INPUT);
@@ -561,42 +706,8 @@ void setup() {
     prevTime[i] = micros();
   }
 
-  Serial.println("===================================");
-  Serial.println("  PID Motor Control with AutoTune");
-  Serial.println("===================================");
-  Serial.println("Motor: 0=FL, 1=FR, 2=ML, 3=MR, 4=BL, 5=BR");
-  Serial.println("Left: 0,2,4 | Right: 1,3,5");
-  Serial.println();
-  Serial.println("--- Manual PWM Commands ---");
-  Serial.println("  M<n> P<pwm> D<dir>  Single motor manual control");
-  Serial.println("  ALL P<pwm> D<dir>   All motors manual");
-  Serial.println("  LEFT P<pwm> D<dir>  Left side manual");
-  Serial.println("  RIGHT P<pwm> D<dir> Right side manual");
-  Serial.println("  S<n>                Gentle stop motor");
-  Serial.println("  X<n>                Immediate stop motor");
-  Serial.println("  STOPALL             Gentle stop all");
-  Serial.println("  RAMPDOWN            Ramp down all (5 PWM/0.5s)");
-  Serial.println("  XALL                Immediate stop all");
-  Serial.println();
-  Serial.println("--- PID RPM Commands ---");
-  Serial.println("  RPM<n> <rpm>        Set motor to target RPM (neg=reverse)");
-  Serial.println("  RPMALL <rpm>        Set all motors to target RPM");
-  Serial.println("  RPMLEFT <rpm>       Left side target RPM");
-  Serial.println("  RPMRIGHT <rpm>      Right side target RPM");
-  Serial.println("  PIDOFF              Disable PID all motors");
-  Serial.println("  PIDOFF<n>           Disable PID single motor");
-  Serial.println();
-  Serial.println("--- PID Tuning Commands ---");
-  Serial.println("  TUNE<n> <Kp> <Ki> <Kd>   Set gains for motor n");
-  Serial.println("  TUNEALL <Kp> <Ki> <Kd>   Set gains for all motors");
-  Serial.println("  AUTOTUNE<n>               AutoTune motor n (sTune)");
-  Serial.println("  AUTOTUNECANCEL            Cancel running autotune");
-  Serial.println("  PIDSTATUS                 Print all PID gains & modes");
-  Serial.println();
-  Serial.println("--- EEPROM Commands ---");
-  Serial.println("  SAVE                Save PID gains to EEPROM");
-  Serial.println("  LOAD                Load PID gains from EEPROM");
-  Serial.println();
+  // Initialize micro-ROS (blocks until agent is available)
+  setupMicroRos();
 }
 
 // ============================================================
@@ -624,326 +735,31 @@ void loop() {
     setMotor(i, motorPWM[i], motorDirection[i]);
   }
 
-  // 7. Print status every 500ms
-  static unsigned long lastPrintTime = 0;
-  if (millis() - lastPrintTime >= 500) {
-    for (int i = 0; i < NMOTORS; i++) {
-      Serial.print("M");
-      Serial.print(i);
-      Serial.print("(");
-      Serial.print(MOTOR_LABELS[i]);
-      Serial.print(") ");
-
-      if (autoTuneRunning && i == autoTuneMotor) {
-        Serial.print("[AUTOTUNE] ");
-      } else if (pidEnabled[i]) {
-        Serial.print("[PID tgt=");
-        Serial.print(pidSetpoint[i], 1);
-        Serial.print("] ");
-      } else {
-        Serial.print("[MAN] ");
-      }
-
-      Serial.print("RPM:");
-      Serial.print(motorRPM[i], 2);
-      if (pidEnabled[i]) {
-        Serial.print(" Out:");
-        Serial.print(pidOutput[i], 1);
-        Serial.print(" I:");
-        Serial.print(pidControllers[i]->GetOutputSum(), 1);
-      }
-      Serial.print(" PWM:");
-      Serial.print(motorPWM[i]);
-      Serial.println();
-    }
-    Serial.println();
-    lastPrintTime = millis();
+  // 7. Publish current motor RPMs every 50ms (matches PID sample rate)
+  static unsigned long lastPublishTime = 0;
+  if (millis() - lastPublishTime >= 50) {
+    publishMotorRpms();
+    lastPublishTime = millis();
   }
 
-  // ============================================================
-  // 8. SERIAL COMMAND PARSER
-  // ============================================================
-  if (Serial.available() > 0) {
-    String command = Serial.readStringUntil('\n');
-    command.trim();
+  // 8. Spin micro-ROS executor (process incoming messages, non-blocking)
+  RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1)));
 
-    // ---- AUTOTUNE commands (check first — longest prefix match) ----
-    if (command.startsWith("AUTOTUNECANCEL")) {
-      cancelAutoTune();
+  // 9. Check subscriber watchdog — stop motors if no messages received
+  checkSubscriberWatchdog();
 
-    } else if (command.startsWith("AUTOTUNE")) {
-      int motorIdx = command.substring(8).toInt();
-      startAutoTune(motorIdx);
-
-    // ---- PIDSTATUS ----
-    } else if (command == "PIDSTATUS") {
-      printPIDStatus();
-
-    // ---- PIDOFF ----
-    } else if (command.startsWith("PIDOFF")) {
-      String rest = command.substring(6);
-      rest.trim();
-      if (rest.length() == 0) {
-        // Disable all
-        for (int i = 0; i < NMOTORS; i++) {
-          disablePID(i);
-          motorPWM[i] = 0;
-        }
-        Serial.println("PID disabled on ALL motors");
-      } else {
-        int idx = rest.toInt();
-        if (idx >= 0 && idx < NMOTORS) {
-          disablePID(idx);
-          motorPWM[idx] = 0;
-          Serial.print("PID disabled on M");
-          Serial.println(idx);
-        }
+  // 10. Periodically ping agent — if lost, emergency stop
+  if (millis() - last_agent_ping >= AGENT_PING_INTERVAL_MS) {
+    if (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
+      if (micro_ros_connected) {
+        emergencyStopAll();
+        micro_ros_connected = false;
       }
-
-    // ---- RPM commands ----
-    } else if (command.startsWith("RPMALL")) {
-      float rpm = parseRPMValue(command, 6);
-      for (int i = 0; i < NMOTORS; i++) {
-        enablePIDForMotor(i, rpm);
-      }
-      Serial.print("Set ALL motors to RPM=");
-      Serial.println(rpm, 1);
-
-    } else if (command.startsWith("RPMLEFT")) {
-      float rpm = parseRPMValue(command, 7);
-      for (int i = 0; i < 3; i++) {
-        enablePIDForMotor(LEFT_MOTORS[i], rpm);
-      }
-      Serial.print("Set LEFT motors to RPM=");
-      Serial.println(rpm, 1);
-
-    } else if (command.startsWith("RPMRIGHT")) {
-      float rpm = parseRPMValue(command, 8);
-      for (int i = 0; i < 3; i++) {
-        enablePIDForMotor(RIGHT_MOTORS[i], rpm);
-      }
-      Serial.print("Set RIGHT motors to RPM=");
-      Serial.println(rpm, 1);
-
-    } else if (command.startsWith("RPM")) {
-      // RPM<n> <value>  e.g. "RPM0 30" or "RPM3 -20"
-      // Find the motor index digit(s) and the RPM value
-      int spacePos = command.indexOf(' ');
-      if (spacePos > 3) {
-        int motorIdx = command.substring(3, spacePos).toInt();
-        float rpm = command.substring(spacePos + 1).toFloat();
-        if (motorIdx >= 0 && motorIdx < NMOTORS) {
-          enablePIDForMotor(motorIdx, rpm);
-          Serial.print("Set M");
-          Serial.print(motorIdx);
-          Serial.print("(");
-          Serial.print(MOTOR_LABELS[motorIdx]);
-          Serial.print(") to RPM=");
-          Serial.println(rpm, 1);
-        }
-      }
-
-    // ---- TUNE commands ----
-    } else if (command.startsWith("TUNEALL")) {
-      // TUNEALL <Kp> <Ki> <Kd>
-      String params = command.substring(7);
-      params.trim();
-      float kp, ki, kd;
-      int s1 = params.indexOf(' ');
-      int s2 = params.indexOf(' ', s1 + 1);
-      if (s1 > 0 && s2 > s1) {
-        kp = params.substring(0, s1).toFloat();
-        ki = params.substring(s1 + 1, s2).toFloat();
-        kd = params.substring(s2 + 1).toFloat();
-        for (int i = 0; i < NMOTORS; i++) {
-          pidKp[i] = kp;
-          pidKi[i] = ki;
-          pidKd[i] = kd;
-          pidControllers[i]->SetTunings(kp, ki, kd);
-        }
-        Serial.print("Set ALL motors: Kp=");
-        Serial.print(kp, 4);
-        Serial.print(" Ki=");
-        Serial.print(ki, 4);
-        Serial.print(" Kd=");
-        Serial.println(kd, 4);
-      } else {
-        Serial.println("Usage: TUNEALL <Kp> <Ki> <Kd>");
-      }
-
-    } else if (command.startsWith("TUNE")) {
-      // TUNE<n> <Kp> <Ki> <Kd>
-      int spacePos = command.indexOf(' ');
-      if (spacePos > 4) {
-        int motorIdx = command.substring(4, spacePos).toInt();
-        String params = command.substring(spacePos + 1);
-        params.trim();
-        int s1 = params.indexOf(' ');
-        int s2 = params.indexOf(' ', s1 + 1);
-        if (motorIdx >= 0 && motorIdx < NMOTORS && s1 > 0 && s2 > s1) {
-          float kp = params.substring(0, s1).toFloat();
-          float ki = params.substring(s1 + 1, s2).toFloat();
-          float kd = params.substring(s2 + 1).toFloat();
-          pidKp[motorIdx] = kp;
-          pidKi[motorIdx] = ki;
-          pidKd[motorIdx] = kd;
-          pidControllers[motorIdx]->SetTunings(kp, ki, kd);
-          Serial.print("Set M");
-          Serial.print(motorIdx);
-          Serial.print(": Kp=");
-          Serial.print(kp, 4);
-          Serial.print(" Ki=");
-          Serial.print(ki, 4);
-          Serial.print(" Kd=");
-          Serial.println(kd, 4);
-        } else {
-          Serial.println("Usage: TUNE<n> <Kp> <Ki> <Kd>");
-        }
-      }
-
-    // ---- SAVE / LOAD ----
-    } else if (command == "SAVE") {
-      savePIDConfig();
-
-    } else if (command == "LOAD") {
-      loadPIDConfig();
-
-    // ---- Manual motor commands (existing) ----
-    } else if (command.startsWith("M")) {
-      int motorIdx = -1;
-      int pwm = 0;
-      int dir = 1;
-      int mPos = command.indexOf('M');
-      int pPos = command.indexOf('P');
-      int dPos = command.indexOf('D');
-
-      if (mPos >= 0 && pPos > mPos) {
-        motorIdx = command.substring(mPos + 1, pPos).toInt();
-        pwm = command.substring(pPos + 1, dPos > pPos ? dPos : command.length()).toInt();
-        if (dPos > pPos) {
-          dir = command.substring(dPos + 1).toInt();
-        }
-        if (motorIdx >= 0 && motorIdx < NMOTORS) {
-          disablePID(motorIdx);  // Switch to manual
-          motorPWM[motorIdx] = pwm;
-          motorDirection[motorIdx] = dir;
-          isStopping[motorIdx] = false;
-          Serial.print("Set Motor ");
-          Serial.print(motorIdx);
-          Serial.print(" to PWM=");
-          Serial.print(pwm);
-          Serial.print(" DIR=");
-          Serial.print(dir);
-          Serial.println(" [MANUAL]");
-        }
-      }
-
-    } else if (command.startsWith("ALL")) {
-      int pwm = 0;
-      int dir = 1;
-      int pPos = command.indexOf('P');
-      int dPos = command.indexOf('D');
-      if (pPos >= 0) {
-        pwm = command.substring(pPos + 1, dPos > pPos ? dPos : command.length()).toInt();
-        if (dPos > pPos) dir = command.substring(dPos + 1).toInt();
-        for (int i = 0; i < NMOTORS; i++) {
-          disablePID(i);
-          motorPWM[i] = pwm;
-          motorDirection[i] = dir;
-          isStopping[i] = false;
-        }
-        Serial.print("Set ALL Motors to PWM=");
-        Serial.print(pwm);
-        Serial.print(" DIR=");
-        Serial.print(dir);
-        Serial.println(" [MANUAL]");
-      }
-
-    } else if (command.startsWith("LEFT")) {
-      int pwm = 0;
-      int dir = 1;
-      int pPos = command.indexOf('P');
-      int dPos = command.indexOf('D');
-      if (pPos >= 0) {
-        pwm = command.substring(pPos + 1, dPos > pPos ? dPos : command.length()).toInt();
-        if (dPos > pPos) dir = command.substring(dPos + 1).toInt();
-        for (int i = 0; i < 3; i++) {
-          int idx = LEFT_MOTORS[i];
-          disablePID(idx);
-          motorPWM[idx] = pwm;
-          motorDirection[idx] = dir;
-          isStopping[idx] = false;
-        }
-        Serial.print("Set LEFT to PWM=");
-        Serial.print(pwm);
-        Serial.print(" DIR=");
-        Serial.print(dir);
-        Serial.println(" [MANUAL]");
-      }
-
-    } else if (command.startsWith("RIGHT")) {
-      int pwm = 0;
-      int dir = 1;
-      int pPos = command.indexOf('P');
-      int dPos = command.indexOf('D');
-      if (pPos >= 0) {
-        pwm = command.substring(pPos + 1, dPos > pPos ? dPos : command.length()).toInt();
-        if (dPos > pPos) dir = command.substring(dPos + 1).toInt();
-        for (int i = 0; i < 3; i++) {
-          int idx = RIGHT_MOTORS[i];
-          disablePID(idx);
-          motorPWM[idx] = pwm;
-          motorDirection[idx] = dir;
-          isStopping[idx] = false;
-        }
-        Serial.print("Set RIGHT to PWM=");
-        Serial.print(pwm);
-        Serial.print(" DIR=");
-        Serial.print(dir);
-        Serial.println(" [MANUAL]");
-      }
-
-    } else if (command.startsWith("RAMPDOWN")) {
-      startRampDown();
-
-    } else if (command.startsWith("STOPALL")) {
-      gentleStopAllMotors();
-      Serial.println("Gentle stopping ALL motors...");
-
-    } else if (command.startsWith("XALL")) {
-      cancelAutoTune();
-      for (int i = 0; i < NMOTORS; i++) {
-        disablePID(i);
-        motorPWM[i] = 0;
-        isStopping[i] = false;
-        stopMotor(i);
-      }
-      Serial.println("Immediately stopped ALL motors");
-
-    } else if (command.startsWith("S") && command.length() >= 2 && isDigit(command.charAt(1))) {
-      int motorIdx = command.substring(1).toInt();
-      if (motorIdx >= 0 && motorIdx < NMOTORS) {
-        gentleStopMotor(motorIdx);
-        Serial.print("Gentle stopping Motor ");
-        Serial.println(motorIdx);
-      }
-
-    } else if (command.startsWith("X") && command.length() >= 2 && isDigit(command.charAt(1))) {
-      int motorIdx = command.substring(1).toInt();
-      if (motorIdx >= 0 && motorIdx < NMOTORS) {
-        disablePID(motorIdx);
-        motorPWM[motorIdx] = 0;
-        isStopping[motorIdx] = false;
-        stopMotor(motorIdx);
-        Serial.print("Immediately stopped Motor ");
-        Serial.println(motorIdx);
-      }
-
     } else {
-      Serial.print("Unknown command: ");
-      Serial.println(command);
+      micro_ros_connected = true;
     }
+    last_agent_ping = millis();
   }
 
-  delay(1);  // Small delay
+  delay(1);  // Small yield
 }
