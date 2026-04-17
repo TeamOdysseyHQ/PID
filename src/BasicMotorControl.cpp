@@ -3,6 +3,8 @@
 #include <QuickPID.h>
 #include <sTune.h>
 #include <EEPROM.h>
+#include <TinyGPS++.h>
+#include <SoftwareSerial.h>
 
 // micro-ROS includes
 #include <micro_ros_arduino.h>
@@ -12,7 +14,17 @@
 #include <rclc/rclc.h>
 #include <rclc/executor.h>
 #include <std_msgs/msg/float32_multi_array.h>
+#include <sensor_msgs/msg/nav_sat_fix.h>
 #include <rmw_microros/rmw_microros.h>
+
+// ============================================================
+// GPS CONFIGURATION (Quectel L86-M33)
+// GPS_RX_PIN : Teensy pin that receives data FROM the GPS (connect to L86 TX)
+// GPS_TX_PIN : Teensy pin that sends data TO the GPS   (connect to L86 RX)
+// ============================================================
+#define GPS_RX_PIN    0    // change to your RX pin
+#define GPS_TX_PIN    1    // change to your TX pin
+#define GPS_BAUD_RATE 9600
 
 // Motor Index Mapping (paired front-to-back):
 //  Index 0 = Front Left   | Index 1 = Front Right
@@ -39,8 +51,8 @@ const int NMOTORS = 6;
 const int ENCO_CH_1[] = {35, 41, 37, 17, 21, 39};  // Encoder Channel A
 const int ENCO_CH_2[] = {34, 40, 36, 16, 20, 38};  // Encoder Channel B
 const int PWM_PIN[] = {4, 7, 3, 6, 2, 5};           // PWM pins
-const int DIR_PIN[] = {27, 26, 27, 26, 26, 27};     // Direction pins
-const int DIR_POLARITY[] = {-1, 1, -1, 1, 1, -1};   // Invert mirrored motors
+const int DIR_PIN[] = {27, 26, 27, 26, 27, 26};     // Direction pins
+const int DIR_POLARITY[] = {-1, -1, -1, -1, -1, -1};   // Invert mirrored motors
 
 const char* MOTOR_LABELS[] = {"FL", "FR", "ML", "MR", "BL", "BR"};
 const int LEFT_MOTORS[] = {0, 2, 4};
@@ -117,6 +129,18 @@ const unsigned long RAMPDOWN_INTERVAL = 500;
 unsigned long lastRampDownTime = 0;
 
 // ============================================================
+// PWM SLEW RATE LIMITER
+// Adjustable: raise STEP or lower INTERVAL = faster ramp; reverse = softer
+// ============================================================
+const int          PWM_SLEW_STEP        = 8;    // max PWM counts changed per interval
+const unsigned long PWM_SLEW_INTERVAL_MS = 12;  // ms between each step per motor
+
+int           currentAppliedPWM[NMOTORS]  = {0};              // PWM actually written to hardware
+int           targetDirection[NMOTORS]    = {1, 1, 1, 1, 1, 1}; // desired direction (set by PID)
+bool          pendingDirChange[NMOTORS]   = {false};            // waiting for PWM→0 before DIR flip
+unsigned long lastSlewTime[NMOTORS]       = {0};
+
+// ============================================================
 // MICRO-ROS VARIABLES
 // ============================================================
 rcl_allocator_t allocator;
@@ -124,11 +148,14 @@ rclc_support_t support;
 rcl_node_t node;
 rcl_subscription_t subscriber;
 rcl_publisher_t publisher;
+rcl_publisher_t gps_publisher;
 rclc_executor_t executor;
 
 // Message objects
 std_msgs__msg__Float32MultiArray sub_msg;
 std_msgs__msg__Float32MultiArray pub_msg;
+sensor_msgs__msg__NavSatFix gps_msg;
+static char gps_frame_id[] = "gps";
 
 // Backing arrays for Float32MultiArray data
 float sub_data[NMOTORS];
@@ -147,6 +174,14 @@ const unsigned long AGENT_PING_INTERVAL_MS = 2000;
 unsigned long lastSubMsgTime = 0;
 const unsigned long SUB_WATCHDOG_TIMEOUT_MS = 3000;
 bool watchdogTriggered = false;
+
+// ============================================================
+// GPS VARIABLES
+// ============================================================
+SoftwareSerial gpsSerial(GPS_RX_PIN, GPS_TX_PIN);
+TinyGPSPlus gps;
+unsigned long lastGpsPublishTime = 0;
+const unsigned long GPS_PUBLISH_INTERVAL_MS = 200;  // publish at up to 5 Hz
 
 // Error check macro — on failure, enter error loop with LED blink
 #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if (temp_rc != RCL_RET_OK) { error_loop(); } }
@@ -302,6 +337,17 @@ void setupMicroRos() {
       ROSIDL_GET_MSG_TYPE_SUPPORT(std_msgs, msg, Float32MultiArray),
       "motor_rpms"));
 
+  // Create GPS publisher on "/gps/fix" with best-effort QoS
+  RCCHECK(rclc_publisher_init_best_effort(
+      &gps_publisher, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, NavSatFix),
+      "/gps/fix"));
+
+  // Initialize GPS message header frame_id
+  gps_msg.header.frame_id.data     = gps_frame_id;
+  gps_msg.header.frame_id.size     = sizeof(gps_frame_id) - 1;
+  gps_msg.header.frame_id.capacity = sizeof(gps_frame_id);
+
   // Initialize messages
   initMessages();
 
@@ -336,6 +382,8 @@ void emergencyStopAll() {
   for (int i = 0; i < NMOTORS; i++) {
     disablePID(i);
     motorPWM[i] = 0;
+    currentAppliedPWM[i] = 0;  // bypass slew — instant cut
+    pendingDirChange[i] = false;
     stopMotor(i);
     isStopping[i] = false;
   }
@@ -535,6 +583,46 @@ void updateRampDown() {
 }
 
 // ============================================================
+// FUNCTION: PWM Slew Rate Limiter
+// Intercepts every hardware write — steps currentAppliedPWM[] toward
+// motorPWM[] at a capped rate. Handles direction reversals safely by
+// coasting to 0 before flipping the DIR pin, then ramping back up.
+// Emergency stop bypasses this by zeroing currentAppliedPWM[] directly.
+// Tune: PWM_SLEW_STEP / PWM_SLEW_INTERVAL_MS at the top of the file.
+// ============================================================
+void updatePWMSlew() {
+  unsigned long now = millis();
+  for (int i = 0; i < NMOTORS; i++) {
+    if (autoTuneRunning && i == autoTuneMotor) continue;  // autotune manages its own output
+
+    if (now - lastSlewTime[i] < PWM_SLEW_INTERVAL_MS) continue;
+    lastSlewTime[i] = now;
+
+    // Resolve the desired PWM for this tick.
+    // If a direction change is pending, force target to 0 until we've coasted down.
+    int desiredPWM = motorPWM[i];
+    if (pendingDirChange[i]) {
+      desiredPWM = 0;
+    }
+
+    // Step currentAppliedPWM toward desiredPWM
+    if (currentAppliedPWM[i] < desiredPWM) {
+      currentAppliedPWM[i] += PWM_SLEW_STEP;
+      if (currentAppliedPWM[i] > desiredPWM) currentAppliedPWM[i] = desiredPWM;
+    } else if (currentAppliedPWM[i] > desiredPWM) {
+      currentAppliedPWM[i] -= PWM_SLEW_STEP;
+      if (currentAppliedPWM[i] < desiredPWM) currentAppliedPWM[i] = desiredPWM;
+    }
+
+    // Once coasted to 0, flip the direction and allow ramp-up next tick
+    if (pendingDirChange[i] && currentAppliedPWM[i] == 0) {
+      motorDirection[i] = targetDirection[i];
+      pendingDirChange[i] = false;
+    }
+  }
+}
+
+// ============================================================
 // FUNCTION: Calculate RPM with low-pass filter
 // ============================================================
 void calculateRPM() {
@@ -654,6 +742,44 @@ void updateAutoTune() {
 }
 
 // ============================================================
+// FUNCTION: Feed GPS serial bytes into TinyGPS++ parser
+// ============================================================
+void readGPS() {
+  while (gpsSerial.available() > 0) {
+    gps.encode(gpsSerial.read());
+  }
+}
+
+// ============================================================
+// FUNCTION: Publish GPS NavSatFix to /gps/fix
+// ============================================================
+void publishGpsFix() {
+  if (!micro_ros_connected) return;
+
+  gps_msg.header.stamp.sec     = (int32_t)(millis() / 1000);
+  gps_msg.header.stamp.nanosec = (uint32_t)((millis() % 1000) * 1000000UL);
+
+  if (gps.location.isValid()) {
+    gps_msg.latitude  = gps.location.lat();
+    gps_msg.longitude = gps.location.lng();
+    gps_msg.altitude  = gps.altitude.isValid() ? gps.altitude.meters() : 0.0;
+    gps_msg.status.status  = 0;   // STATUS_FIX
+    gps_msg.status.service = 1;   // SERVICE_GPS
+  } else {
+    gps_msg.latitude  = 0.0;
+    gps_msg.longitude = 0.0;
+    gps_msg.altitude  = 0.0;
+    gps_msg.status.status  = -1;  // STATUS_NO_FIX
+    gps_msg.status.service = 1;   // SERVICE_GPS
+  }
+
+  gps_msg.position_covariance_type = 0;  // COVARIANCE_TYPE_UNKNOWN
+  for (int i = 0; i < 9; i++) gps_msg.position_covariance[i] = 0.0;
+
+  RCSOFTCHECK(rcl_publish(&gps_publisher, &gps_msg, NULL));
+}
+
+// ============================================================
 // FUNCTION: PID compute step (called every loop)
 // ============================================================
 void updatePIDControl() {
@@ -663,7 +789,11 @@ void updatePIDControl() {
 
     if (pidControllers[i]->Compute()) {
       motorPWM[i] = constrain((int)pidOutput[i], 0, 255);
-      motorDirection[i] = pidDirection[i];
+      // Feed desired direction to slew layer; motorDirection[] is managed by updatePWMSlew()
+      if (targetDirection[i] != pidDirection[i]) {
+        targetDirection[i] = pidDirection[i];
+        pendingDirChange[i] = true;
+      }
     }
   }
 }
@@ -706,6 +836,9 @@ void setup() {
     prevTime[i] = micros();
   }
 
+  // Initialize GPS serial (Quectel L86-M33)
+  gpsSerial.begin(GPS_BAUD_RATE);
+
   // Initialize micro-ROS (blocks until agent is available)
   setupMicroRos();
 }
@@ -729,10 +862,13 @@ void loop() {
   // 5. Update ramp-down
   updateRampDown();
 
+  // 5.5. Update PWM slew rate limiter (steps currentAppliedPWM toward motorPWM)
+  updatePWMSlew();
+
   // 6. Apply motor settings (skip autotune motor — handled in updateAutoTune)
   for (int i = 0; i < NMOTORS; i++) {
     if (autoTuneRunning && i == autoTuneMotor) continue;
-    setMotor(i, motorPWM[i], motorDirection[i]);
+    setMotor(i, currentAppliedPWM[i], motorDirection[i]);
   }
 
   // 7. Publish current motor RPMs every 50ms (matches PID sample rate)
@@ -742,13 +878,20 @@ void loop() {
     lastPublishTime = millis();
   }
 
-  // 8. Spin micro-ROS executor (process incoming messages, non-blocking)
+  // 8. Read GPS serial data and publish NavSatFix at up to 5 Hz
+  readGPS();
+  if (millis() - lastGpsPublishTime >= GPS_PUBLISH_INTERVAL_MS) {
+    publishGpsFix();
+    lastGpsPublishTime = millis();
+  }
+
+  // 9. Spin micro-ROS executor (process incoming messages, non-blocking)
   RCSOFTCHECK(rclc_executor_spin_some(&executor, RCL_MS_TO_NS(1)));
 
-  // 9. Check subscriber watchdog — stop motors if no messages received
+  // 10. Check subscriber watchdog — stop motors if no messages received
   checkSubscriberWatchdog();
 
-  // 10. Periodically ping agent — if lost, emergency stop
+  // 11. Periodically ping agent — if lost, emergency stop
   if (millis() - last_agent_ping >= AGENT_PING_INTERVAL_MS) {
     if (rmw_uros_ping_agent(100, 1) != RMW_RET_OK) {
       if (micro_ros_connected) {
