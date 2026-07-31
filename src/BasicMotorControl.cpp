@@ -818,7 +818,7 @@ void setup() {
 
   // PWM frequency 30kHz
   for (int i = 0; i < NMOTORS; i++) {
-    analogWriteFrequency(PWM_PIN[i], 30000);
+    analogWriteFrequency(PWM_PIN[i], 1000);
   }
 
   // Initialize PID controllers
