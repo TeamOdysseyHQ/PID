@@ -5,6 +5,8 @@
 #include <EEPROM.h>
 #include <TinyGPS++.h>
 #include <SoftwareSerial.h>
+#include <imx_rt1060/imx_rt1060_i2c_driver.h>
+#include "AsyncBno055.h"
 
 // micro-ROS includes
 #include <micro_ros_arduino.h>
@@ -15,6 +17,7 @@
 #include <rclc/executor.h>
 #include <std_msgs/msg/float32_multi_array.h>
 #include <sensor_msgs/msg/nav_sat_fix.h>
+#include <sensor_msgs/msg/imu.h>
 #include <rmw_microros/rmw_microros.h>
 
 // ============================================================
@@ -183,6 +186,13 @@ TinyGPSPlus gps;
 unsigned long lastGpsPublishTime = 0;
 const unsigned long GPS_PUBLISH_INTERVAL_MS = 200;  // publish at up to 5 Hz
 
+// Master uses Teensy 4.1 SDA 18 / SCL 19. Do not use Wire on this bus.
+AsyncBno055 bno(Master);
+rcl_publisher_t imu_publisher;
+sensor_msgs__msg__Imu imu_msg;
+// Keep the native sensor axes. ROS must supply the actual mounting transform.
+static char imu_frame_id[] = "imu_link";
+
 // Error check macro — on failure, enter error loop with LED blink
 #define RCCHECK(fn) { rcl_ret_t temp_rc = fn; if (temp_rc != RCL_RET_OK) { error_loop(); } }
 #define RCSOFTCHECK(fn) { rcl_ret_t temp_rc = fn; (void)temp_rc; }
@@ -343,6 +353,15 @@ void setupMicroRos() {
       ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, NavSatFix),
       "/gps/fix"));
 
+  RCCHECK(rclc_publisher_init_best_effort(
+      &imu_publisher, &node,
+      ROSIDL_GET_MSG_TYPE_SUPPORT(sensor_msgs, msg, Imu),
+      "/imu/data"));
+
+  imu_msg.header.frame_id.data = imu_frame_id;
+  imu_msg.header.frame_id.size = sizeof(imu_frame_id) - 1;
+  imu_msg.header.frame_id.capacity = sizeof(imu_frame_id);
+
   // Initialize GPS message header frame_id
   gps_msg.header.frame_id.data     = gps_frame_id;
   gps_msg.header.frame_id.size     = sizeof(gps_frame_id) - 1;
@@ -356,6 +375,8 @@ void setupMicroRos() {
   RCCHECK(rclc_executor_add_subscription(
       &executor, &subscriber, &sub_msg, &motorRpmCallback, ON_NEW_DATA));
 
+  // Time synchronization may wait here, before any motor command is processed.
+  rmw_uros_sync_session(1000);
   micro_ros_connected = true;
   lastSubMsgTime = millis();
 }
@@ -751,13 +772,19 @@ void readGPS() {
 }
 
 // ============================================================
-// FUNCTION: Publish GPS NavSatFix to /gps/fix
+// FUNCTION: Synchronized sensor timestamps
 // ============================================================
-void publishGpsFix() {
-  if (!micro_ros_connected) return;
+bool sensorStamp(builtin_interfaces__msg__Time& stamp, uint32_t ageMs = 0) {
+  if (!rmw_uros_epoch_synchronized()) return false;
+  const int64_t ns = rmw_uros_epoch_nanos() - static_cast<int64_t>(ageMs) * 1000000;
+  if (ns <= 0) return false;
+  stamp.sec = ns / 1000000000;
+  stamp.nanosec = ns % 1000000000;
+  return true;
+}
 
-  gps_msg.header.stamp.sec     = (int32_t)(millis() / 1000);
-  gps_msg.header.stamp.nanosec = (uint32_t)((millis() % 1000) * 1000000UL);
+void publishGpsFix() {
+  if (!micro_ros_connected || !sensorStamp(gps_msg.header.stamp)) return;
 
   if (gps.location.isValid()) {
     gps_msg.latitude  = gps.location.lat();
@@ -777,6 +804,39 @@ void publishGpsFix() {
   for (int i = 0; i < 9; i++) gps_msg.position_covariance[i] = 0.0;
 
   RCSOFTCHECK(rcl_publish(&gps_publisher, &gps_msg, NULL));
+}
+
+// Keep time-sync retries outside active motor control. The call can wait 10 ms.
+void retrySensorTimeSync() {
+  static unsigned long lastAttempt = 0;
+  if (!micro_ros_connected || rmw_uros_epoch_synchronized() || autoTuneRunning ||
+      millis() - lastAttempt < 5000) return;
+  for (int i = 0; i < NMOTORS; ++i) {
+    if (pidEnabled[i] || currentAppliedPWM[i] != 0 || motorPWM[i] != 0) return;
+  }
+  lastAttempt = millis();
+  rmw_uros_sync_session(10);
+}
+
+void updateImu() {
+  if (!bno.poll(millis()) || !micro_ros_connected) return;
+  const AsyncBno055::Sample& sample = bno.sample();
+  const uint32_t ageMs = millis() - sample.startedMs;
+  if (ageMs > 100 || !sensorStamp(imu_msg.header.stamp, ageMs)) return;
+
+  imu_msg.orientation.w = sample.orientation[0];
+  imu_msg.orientation.x = sample.orientation[1];
+  imu_msg.orientation.y = sample.orientation[2];
+  imu_msg.orientation.z = sample.orientation[3];
+  // Unknown covariances stay zero. Uncalibrated orientation is unavailable.
+  imu_msg.orientation_covariance[0] = sample.calibrated ? 0.0 : -1.0;
+  imu_msg.angular_velocity.x = sample.angularVelocity[0];
+  imu_msg.angular_velocity.y = sample.angularVelocity[1];
+  imu_msg.angular_velocity.z = sample.angularVelocity[2];
+  imu_msg.linear_acceleration.x = sample.acceleration[0];
+  imu_msg.linear_acceleration.y = sample.acceleration[1];
+  imu_msg.linear_acceleration.z = sample.acceleration[2];
+  RCSOFTCHECK(rcl_publish(&imu_publisher, &imu_msg, NULL));
 }
 
 // ============================================================
@@ -816,7 +876,7 @@ void setup() {
     stopMotor(i);
   }
 
-  // PWM frequency 30kHz
+  // PWM frequency 1 kHz
   for (int i = 0; i < NMOTORS; i++) {
     analogWriteFrequency(PWM_PIN[i], 1000);
   }
@@ -838,6 +898,9 @@ void setup() {
 
   // Initialize GPS serial (Quectel L86-M33)
   gpsSerial.begin(GPS_BAUD_RATE);
+
+  // Sensor startup advances in loop(), with no reset/calibration waits.
+  bno.begin(millis());
 
   // Initialize micro-ROS (blocks until agent is available)
   setupMicroRos();
@@ -890,6 +953,10 @@ void loop() {
 
   // 10. Check subscriber watchdog — stop motors if no messages received
   checkSubscriberWatchdog();
+
+  // Service IMU transfers only after processing commands and the watchdog.
+  retrySensorTimeSync();
+  updateImu();
 
   // 11. Periodically ping agent — if lost, emergency stop
   if (millis() - last_agent_ping >= AGENT_PING_INTERVAL_MS) {
