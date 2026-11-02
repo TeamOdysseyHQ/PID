@@ -7,6 +7,7 @@
 #include <SoftwareSerial.h>
 #include <imx_rt1060/imx_rt1060_i2c_driver.h>
 #include "AsyncBno055.h"
+#include "ImuCalibration.h"
 
 // micro-ROS includes
 #include <micro_ros_arduino.h>
@@ -188,6 +189,7 @@ const unsigned long GPS_PUBLISH_INTERVAL_MS = 200;  // publish at up to 5 Hz
 
 // Master uses Teensy 4.1 SDA 18 / SCL 19. Do not use Wire on this bus.
 AsyncBno055 bno(Master);
+ImuCalibration imuCalibration;
 rcl_publisher_t imu_publisher;
 sensor_msgs__msg__Imu imu_msg;
 // Keep the native sensor axes. ROS must supply the actual mounting transform.
@@ -900,7 +902,8 @@ void setup() {
   gpsSerial.begin(GPS_BAUD_RATE);
 
   // Sensor startup advances in loop(), with no reset/calibration waits.
-  bno.begin(millis());
+  EEPROM.get(ImuCalibration::EEPROM_ADDRESS, imuCalibration);
+  bno.begin(millis(), imuCalibration.valid() ? imuCalibration.offsets() : nullptr);
 
   // Initialize micro-ROS (blocks until agent is available)
   setupMicroRos();

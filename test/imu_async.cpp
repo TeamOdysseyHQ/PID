@@ -1,4 +1,5 @@
 #include "AsyncBno055.h"
+#include "ImuCalibration.h"
 #include <cassert>
 #include <cstring>
 #include <iostream>
@@ -14,6 +15,7 @@ public:
   bool stalled = false;
   bool absent = false;
   bool shortRead = false;
+  bool corruptProfileRead = false;
   bool stopped = false;
   bool busyAfterReset = false;
   size_t transfers = 0;
@@ -53,7 +55,7 @@ public:
 
   void write_async(uint8_t address, uint8_t* data, size_t size, bool stop) override {
     assert(address == 0x28 && !pending && !stopped);
-    assert((size == 1 && !stop) || (size == 2 && stop));
+    assert((size == 1 && !stop) || (size >= 2 && stop));
     start(data, size, false);
   }
   void read_async(uint8_t address, uint8_t* data, size_t size, bool stop) override {
@@ -87,10 +89,12 @@ public:
     completedBytes = reading && shortRead ? length - 1 : length;
     if (reading) {
       std::memcpy(buffer, registers + reg, completedBytes);
+      if (reg == 0x55 && corruptProfileRead) buffer[0] ^= 1;
     } else {
       reg = buffer[0];
-      if (length == 2) {
-        registers[reg] = buffer[1];
+      if (length >= 2) {
+        if (reg == 0x55) assert((registers[0x3D] & 15) == 0);
+        std::memcpy(registers + reg, buffer + 1, length - 1);
         if (reg == 0x3D) registers[reg] |= 0x10;  // Reserved mode bit.
       }
     }
@@ -121,6 +125,36 @@ struct Rig {
 };
 
 int main() {
+  {
+    ImuCalibration profile;
+    assert(!profile.valid());
+    for (size_t i = 0; i < 22; ++i) profile.offsets()[i] = i + 1;
+    profile.seal();
+    assert(profile.valid());
+    for (size_t i = 0; i < sizeof(profile.bytes); ++i) {
+      profile.bytes[i] ^= 1;
+      assert(!profile.valid());
+      profile.bytes[i] ^= 1;
+    }
+    Rig rig;
+    rig.imu.begin(0, profile.offsets());
+    rig.nextSample();
+    assert(std::memcmp(rig.bus.registers + 0x55, profile.offsets(), 22) == 0);
+    Rig bad;
+    bad.imu.begin(0, profile.offsets());
+    bad.bus.corruptProfileRead = true;
+    bad.run(2500);
+    assert(bad.samples == 0);
+    bad.bus.corruptProfileRead = false;
+    bad.nextSample();
+    // Recovery must retain and restore the same saved profile.
+    std::memset(rig.bus.registers + 0x55, 0, 22);
+    rig.bus.stalled = true;
+    rig.run(100);
+    rig.bus.stalled = false;
+    rig.nextSample();
+    assert(std::memcmp(rig.bus.registers + 0x55, profile.offsets(), 22) == 0);
+  }
   {
     Rig rig;
     rig.run(849);
@@ -201,5 +235,6 @@ int main() {
     assert(rig.samples - before == 100);
   }
   std::cout << "PASS: sampling, units, calibration, stalled bus, missing sensor, "
-               "short reads, recovery, invalid quaternion, sensor error, clock wrap\n";
+               "short reads, recovery, invalid quaternion, sensor error, clock wrap, "
+               "profile checksum and restore readback\n";
 }

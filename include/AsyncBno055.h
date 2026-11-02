@@ -19,7 +19,9 @@ public:
 
   explicit AsyncBno055(I2CMaster& bus) : bus_(bus) {}
 
-  void begin(uint32_t now) {
+  // calibration must remain alive while this driver runs, including retries.
+  void begin(uint32_t now, const uint8_t* calibration = nullptr) {
+    calibration_ = calibration;
     bus_.begin(400000);
     phase_ = Phase::Probe;
     transfer_ = Transfer::Idle;
@@ -53,7 +55,7 @@ public:
 
     switch (phase_) {
       case Phase::Retry:
-        begin(now);
+        begin(now, calibration_);
         break;
       case Phase::Probe:
         read(0x00, 1, Phase::CheckId, now);
@@ -80,7 +82,26 @@ public:
         write(0x3B, 0x80, Phase::Oscillator, 0, now);
         break;
       case Phase::Oscillator:
-        write(0x3F, 0x00, Phase::Fusion, 10, now);
+        write(0x3F, 0x00, calibration_ ? Phase::Restore : Phase::Fusion, 10, now);
+        break;
+      case Phase::Restore:
+        tx_[0] = 0x55;
+        for (size_t i = 0; i < 22; ++i) tx_[i + 1] = calibration_[i];
+        expectedBytes_ = sizeof(tx_);
+        settleMs_ = 0;
+        phase_ = Phase::VerifyProfile;
+        transfer_ = Transfer::Writing;
+        transferStarted_ = now;
+        bus_.write_async(ADDRESS, tx_, sizeof(tx_), true);
+        break;
+      case Phase::VerifyProfile:
+        read(0x55, 22, Phase::CheckProfile, now);
+        break;
+      case Phase::CheckProfile:
+        for (size_t i = 0; i < 22; ++i) {
+          if (rx_[i] != calibration_[i]) { fail(now); return false; }
+        }
+        phase_ = Phase::Fusion;
         break;
       case Phase::Fusion:
         write(0x3D, 0x0C, Phase::Sample, 25, now);
@@ -109,7 +130,7 @@ public:
 private:
   enum class Phase {
     Probe, CheckId, Reset, ProbeAfterReset, CheckResetId, Power, Units,
-    Oscillator, Fusion, Sample, Decode, Retry
+    Oscillator, Restore, VerifyProfile, CheckProfile, Fusion, Sample, Decode, Retry
   };
   enum class Transfer { Idle, Selecting, Reading, Writing };
   static constexpr uint8_t ADDRESS = 0x28;
@@ -122,7 +143,8 @@ private:
   uint32_t nextSampleAt_ = 0;
   size_t expectedBytes_ = 0;
   size_t readLength_ = 0;
-  uint8_t tx_[2] = {};
+  const uint8_t* calibration_ = nullptr;
+  uint8_t tx_[23] = {};
   uint8_t rx_[0x3E - 0x08] = {};
   Sample sample_ = {};
 
@@ -149,12 +171,12 @@ private:
   void write(uint8_t reg, uint8_t value, Phase next, uint32_t settle, uint32_t now) {
     tx_[0] = reg;
     tx_[1] = value;
-    expectedBytes_ = sizeof(tx_);
+    expectedBytes_ = 2;
     settleMs_ = settle;
     phase_ = next;
     transfer_ = Transfer::Writing;
     transferStarted_ = now;
-    bus_.write_async(ADDRESS, tx_, sizeof(tx_), true);
+    bus_.write_async(ADDRESS, tx_, 2, true);
   }
 
   int16_t value(size_t offset) const {
