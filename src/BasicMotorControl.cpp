@@ -56,7 +56,7 @@ const int ENCO_CH_1[] = {35, 41, 37, 17, 21, 39};  // Encoder Channel A
 const int ENCO_CH_2[] = {34, 40, 36, 16, 20, 38};  // Encoder Channel B
 const int PWM_PIN[] = {4, 7, 3, 6, 2, 5};           // PWM pins
 const int DIR_PIN[] = {27, 26, 27, 26, 27, 26};     // Direction pins
-const int DIR_POLARITY[] = {-1, -1, -1, -1, -1, -1};   // Invert mirrored motors
+const int DIR_POLARITY[] = {1, -1, 1, -1, 1, -1};     // FL, FR, ML, MR, BL, BR
 
 const char* MOTOR_LABELS[] = {"FL", "FR", "ML", "MR", "BL", "BR"};
 const int LEFT_MOTORS[] = {0, 2, 4};
